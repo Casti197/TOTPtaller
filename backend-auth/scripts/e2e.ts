@@ -15,6 +15,12 @@ function check(name: string, ok: boolean, extra?: unknown): void {
   if (!ok) failures++;
 }
 
+/** El login exitoso devuelve una página que abre el deep link: se extrae del enlace "Volver a la app". */
+async function deepLinkOf(r: Response): Promise<string> {
+  const href = /id="back" href="([^"]+)"/.exec(await r.text())?.[1] ?? '';
+  return href.replace(/&amp;/g, '&');
+}
+
 async function post(path: string, body: Record<string, string>, form = false): Promise<Response> {
   return fetch(BASE + path, {
     method: 'POST',
@@ -45,8 +51,8 @@ async function main(): Promise<void> {
   check('Login con contraseña incorrecta → 401', bad.status === 401);
 
   const login = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
-  const location = login.headers.get('location') ?? '';
-  check('Login → 302 al deep link', login.status === 302 && location.startsWith(REDIRECT), location);
+  const location = await deepLinkOf(login);
+  check('Login → página que abre el deep link', login.status === 200 && location.startsWith(REDIRECT), location);
   const cb = new URL(location);
   check('state regresa intacto', cb.searchParams.get('state') === state);
   const code = cb.searchParams.get('code') ?? '';
@@ -59,7 +65,7 @@ async function main(): Promise<void> {
   check('PKCE con code_verifier incorrecto → 400', wrong.status === 400);
 
   const login2 = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
-  const code2 = new URL(login2.headers.get('location') ?? '').searchParams.get('code') ?? '';
+  const code2 = new URL(await deepLinkOf(login2)).searchParams.get('code') ?? '';
   const tokRes = await post('/auth/oauth/token', {
     grant_type: 'authorization_code', code: code2, code_verifier: verifier,
     redirect_uri: REDIRECT, client_id: 'unisabana-mobile',

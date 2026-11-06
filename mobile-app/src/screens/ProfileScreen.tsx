@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
 import { useAuth } from '../auth/AuthContext';
@@ -115,7 +115,11 @@ export function ProfileScreen() {
             {token ? `${token.slice(0, 16)}… · expira en ${left !== null ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : '?'}` : 'ninguno (se obtendrá con refresh)'}
           </Text>
           <Text style={ui.small}>refresh_token</Text>
-          <Text style={ui.monoSmall}>Keychain / Keystore (expo-secure-store)</Text>
+          <Text style={ui.monoSmall}>
+            {Platform.OS === 'web'
+              ? 'Solo memoria (web: no hay Keychain/Keystore; nunca localStorage)'
+              : 'Keychain / Keystore (expo-secure-store)'}
+          </Text>
         </View>
         <Button title="Recargar perfil" variant="secondary" onPress={() => void loadProfile()} loading={busy} />
       </View>

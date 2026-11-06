@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import * as Linking from 'expo-linking';
 import * as WebBrowser from 'expo-web-browser';
 import { API_URL, CLIENT_ID, assertApiConfigured } from '../config';
@@ -17,6 +18,13 @@ export type LoginResult = { ok: true } | { ok: false; reason: 'cancelled' | 'err
  *  - Expo Go: exp://<IP>:8081/--/oauth/callback (Expo Go no puede registrar esquemas propios)
  */
 export function getRedirectUri(): string {
+  // Dentro de Expo Go solo existe exp:// (el esquema propio no está instalado en el teléfono).
+  // expoGoConfig solo está presente en Expo Go. En este SDK Expo Go reporta executionEnvironment="bare",
+  // así que createURL devuelve unisabana-auth:// (que ninguna app atiende): se construye la URI explícitamente.
+  const hostUri = Constants.expoConfig?.hostUri;
+  if (Constants.expoGoConfig && hostUri) {
+    return `exp://${hostUri.replace(/\/+$/, '')}/--/oauth/callback`;
+  }
   return Linking.createURL('oauth/callback');
 }
 

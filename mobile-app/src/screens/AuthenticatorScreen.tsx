@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
 import { ManualSecretForm } from '../components/ManualSecretForm';
 import { Notice } from '../components/Notice';
@@ -23,11 +23,18 @@ export function AuthenticatorScreen() {
     setSaved(`Cuenta ${a.issuer} · ${a.account} guardada en el almacenamiento seguro`);
   };
 
-  const confirmRemove = () =>
+  const remove = () => void removeAccount().then(() => setSaved(null));
+  const confirmRemove = () => {
+    // En web, Alert.alert con botones no hace nada: se usa el confirm nativo del navegador
+    if (Platform.OS === 'web') {
+      if (window.confirm('Eliminar cuenta: se borrará la semilla de este dispositivo.')) remove();
+      return;
+    }
     Alert.alert('Eliminar cuenta', 'Se borrará la semilla de este dispositivo.', [
       { text: 'Cancelar', style: 'cancel' },
-      { text: 'Eliminar', style: 'destructive', onPress: () => void removeAccount().then(() => setSaved(null)) },
+      { text: 'Eliminar', style: 'destructive', onPress: remove },
     ]);
+  };
 
   return (
     <ScrollView style={ui.screen} contentContainerStyle={ui.content} keyboardShouldPersistTaps="handled">

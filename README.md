@@ -14,6 +14,7 @@ Laboratorio de Seguridad Móvil · Desarrollo Móvil (React Native) · Universid
 - Node.js 20+ (probado con Node 24) y npm.
 - Un teléfono con **Expo Go** (Android o iOS) en la **misma red Wi-Fi** que el PC.
 - Google Authenticator en el teléfono (prueba de paridad).
+- Alternativa sin teléfono: la app también corre en el **navegador** (ver [3.1 Versión web](#31-versión-web)).
 
 ## 2. Backend (`/backend-auth`)
 
@@ -72,11 +73,25 @@ npm run typecheck # TypeScript estricto
 npm run lint
 ```
 
+### 3.1 Versión web
+
+```bash
+cd mobile-app
+npx expo start --web        # abre http://localhost:8081
+```
+
+- **Login:** `WebBrowser.openAuthSessionAsync` abre `/oauth/authorize` en una **ventana emergente** del navegador. Al terminar, la ventana vuelve a `http://localhost:8081/oauth/callback`, `WebBrowser.maybeCompleteAuthSession()` le pasa el resultado a la ventana principal y se cierra. Si el navegador bloquea la ventana emergente, permítela para `localhost`.
+- **Almacenamiento:** en web no existe Keychain ni Keystore. `src/auth/secureStorage.web.ts` (Metro lo elige automáticamente) guarda el `refresh_token` y la semilla TOTP **solo en memoria**, nunca en `localStorage`, que es texto plano accesible por XSS. Por eso **recargar la página o escribir una URL en la barra cierra la sesión y borra la semilla**. Navega siempre desde la app.
+- **Authenticator sin red:** en las DevTools (F12) → **Network** → **Offline**. El código se sigue regenerando cada 30 s sin peticiones.
+- **QR:** `expo-camera` lee QR con la webcam. Si no tienes cámara, usa *Ingresar semilla manualmente* (`JBSWY3DPEHPK3PXP`).
+
 ### Deep link / redirect_uri
 
+- **Web:** `http://localhost:8081/oauth/callback`. El backend solo acepta `http`/`https` cuando el host es `localhost` o `127.0.0.1`.
 - **Build propia** (`npx expo run:android` o EAS): esquema propio `unisabana-auth://oauth/callback`, configurado en `app.json` → `"scheme": "unisabana-auth"`.
-- **Expo Go**: Expo Go no puede registrar esquemas propios, así que `Linking.createURL('oauth/callback')` produce `exp://<IP>:8081/--/oauth/callback`.
-  El backend acepta únicamente los esquemas `unisabana-auth:` y `exp:` como `redirect_uri`. La pantalla de bienvenida muestra el valor exacto en uso.
+- **Expo Go**: Expo Go no puede registrar esquemas propios, así que se usa `exp://<IP>:8081/--/oauth/callback`. La app lo construye a partir de `Constants.expoConfig.hostUri` cuando detecta `Constants.expoGoConfig`, porque en este SDK Expo Go reporta `executionEnvironment="bare"` y `Linking.createURL` devolvería `unisabana-auth://`, que ninguna app atiende en el teléfono.
+- En Android la página de retorno abre el deep link como `intent://…#Intent;scheme=exp;end`, porque Chrome ignora en silencio un `302` o un enlace a un esquema propio después de un POST.
+- Como `redirect_uri` el backend acepta únicamente `unisabana-auth:`, `exp:` y `http(s)://localhost` o `127.0.0.1`. La pantalla de bienvenida muestra el valor exacto en uso.
 
 ---
 
@@ -90,7 +105,7 @@ npm run lint
     state = 128 bits aleatorios
  2. openAuthSessionAsync ───────────────────────▶ GET /oauth/authorize ─────────▶ formulario de login
                                                   POST credenciales ────────────▶ guarda {challenge, redirect_uri}
-    ◀── deep link ?code&state ◀──────────────────  302 redirect_uri ◀───────────  code (60 s, un solo uso)
+    ◀── deep link ?code&state ◀──────────────────  redirect_uri (JS) ◀──────────  code (60 s, un solo uso)
  3. state == state guardado? (si no → abortar)
  4. POST /auth/oauth/token {code, code_verifier} ───────────────────────────────▶ B64URL(SHA256(verifier)) == challenge?
     ◀──────────── access_token (5 min) + refresh_token (30 días) ◀─────────────
@@ -112,7 +127,7 @@ npm run lint
 | PKCE (verifier, challenge S256, state) | `mobile-app/src/crypto/pkce.ts` |
 | Navegador seguro + validación de `state` + token exchange | `mobile-app/src/auth/oauth.ts` |
 | Verificación PKCE, code de un solo uso, rotación de refresh | `backend-auth/src/routes/oauth.ts` |
-| SecureStore (Keychain/Keystore) | `mobile-app/src/auth/secureStorage.ts` |
+| SecureStore (Keychain/Keystore) | `mobile-app/src/auth/secureStorage.ts` (web: `secureStorage.web.ts`, solo memoria) |
 | access_token en RAM + **Silent Refresh Queue** | `mobile-app/src/api/session.ts` |
 | SHA-1 y HMAC-SHA1 desde cero | `mobile-app/src/crypto/sha1.ts`, `hmac.ts` |
 | TOTP RFC 6238 (contador Big-Endian, truncamiento dinámico) | `mobile-app/src/crypto/totp.ts` |
@@ -129,7 +144,7 @@ npm run lint
 - **El `state` se valida antes del intercambio.** Si no coincide, el intercambio se aborta (anti-CSRF).
 - **El `authorization_code` es de un solo uso**, expira en 60 s y queda ligado a `redirect_uri`, `client_id` y `code_challenge`.
 - **Rotación de `refresh_token`.** Cada renovación invalida el token anterior.
-- **La semilla TOTP vive en SecureStore**, nunca en AsyncStorage.
+- **La semilla TOTP vive en SecureStore**, nunca en AsyncStorage. En web vive solo en memoria, porque no hay almacenamiento cifrado por hardware.
 - **La comparación TOTP es en tiempo constante** (`timingSafeEqual`) y no corta el bucle de ventanas.
 - **TTL anti-replay de 90 s**, que cubre exactamente las tres ventanas aceptadas (C-1, C, C+1).
 - **Alcance de la PoC.** Se usa HTTP en LAN para la demo. En producción: HTTPS, Universal Links / App Links para la redirección, almacenamiento persistente con hash de los refresh tokens, y limitación de intentos en `/auth/mfa/verify`.
@@ -153,12 +168,21 @@ npm run lint
 
 **Extra (Silent Refresh Queue):** pestaña **Perfil** → *1 · Simular access_token expirado* → *2 · Lanzar 3 peticiones concurrentes*. El registro muestra tres `401`, **una sola** llamada `POST /auth/refresh` y tres reintentos `200`, sin salir de la pantalla. *Simular refresh_token revocado* limpia SecureStore y regresa a la pantalla de bienvenida.
 
+**En web** (`npx expo start --web`) se ejecutan las mismas pruebas, con estas diferencias:
+
+| # | Diferencia en web |
+| --- | --- |
+| 1 | El login se abre en una ventana emergente del navegador y vuelve sola a la app. El `refresh_token` queda en memoria (Perfil → "Solo memoria"). |
+| 2 | La app web en el PC al lado de Google Authenticator en el teléfono. |
+| 3 | F12 → **Network** → **Offline** en lugar de Modo Avión. |
+| 4–5 | Iguales. No recargues la página: en web la semilla y la sesión viven solo en memoria. |
+
 ## 6. Endpoints
 
 | Método | Ruta | Descripción |
 | --- | --- | --- |
 | GET | `/oauth/authorize` | Página de login (parámetros: `response_type=code`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`) |
-| POST | `/oauth/authorize` | Valida credenciales → `302 redirect_uri?code=…&state=…` |
+| POST | `/oauth/authorize` | Valida credenciales → página que abre `redirect_uri?code=…&state=…` (JS + botón "Volver a la app"; Chrome en Android ignora un `302` a un esquema propio tras un POST) |
 | POST | `/auth/oauth/token` | `{grant_type, code, code_verifier, redirect_uri, client_id}` → `access_token` + `refresh_token` |
 | POST | `/auth/refresh` | `{refresh_token}` → tokens nuevos (rotación) · `401` si venció o fue revocado |
 | POST | `/auth/logout` | Revoca el `refresh_token` |

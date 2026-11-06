@@ -10,10 +10,16 @@ export const CLIENT_ID = 'unisabana-mobile';
 const VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
 const CHALLENGE_RE = /^[A-Za-z0-9\-_]{43}$/;
 
-/** Esquemas de redirección permitidos: el esquema propio y exp:// (Expo Go en desarrollo). */
+/**
+ * Redirecciones permitidas: el esquema propio, exp:// (Expo Go en desarrollo) y la versión web de la app
+ * servida en el propio PC (http://localhost o http://127.0.0.1, cualquier puerto). Ningún otro host http.
+ */
 function allowedRedirect(uri: string): boolean {
   try {
     const u = new URL(uri);
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      return u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+    }
     return u.protocol === 'unisabana-auth:' || u.protocol === 'exp:';
   } catch {
     return false;
@@ -115,8 +121,42 @@ oauthRouter.post('/oauth/authorize', (req, res) => {
   const redirect = new URL(p.redirect_uri);
   redirect.searchParams.set('code', code);
   redirect.searchParams.set('state', p.state);
-  res.redirect(302, redirect.toString());
+  // Chrome (Android) suele ignorar en silencio un 302 hacia un esquema propio (exp://, unisabana-auth://)
+  // cuando viene tras un POST. Se entrega una página que abre el deep link por JS y ofrece un botón
+  // (gesto del usuario, siempre permitido) como respaldo.
+  const target = redirect.toString();  const android = /Android/i.test(req.get('user-agent') ?? '');
+  res.type('html').send(callbackPage(android ? androidIntent(redirect) : target, target));
 });
+
+/**
+ * En Android, Chrome/Custom Tabs ignoran a menudo los enlaces a esquemas propios (exp://…).
+ * La sintaxis intent:// la entrega directamente al sistema, que abre la app indicada.
+ * exp://host:8081/--/oauth/callback?x → intent://host:8081/--/oauth/callback?x#Intent;scheme=exp;package=…;end
+ */
+function androidIntent(u: URL): string {
+  const scheme = u.protocol.slice(0, -1);
+  const rest = u.toString().slice(u.protocol.length).replace(/^\/\//, '');
+  // Sin package=: si el paquete no coincide exactamente, Chrome manda a Play Store. Android resuelve por esquema.
+  return `intent://${rest}#Intent;scheme=${scheme};end`;
+}
+
+function callbackPage(target: string, plain: string = target): string {
+  // JSON con "<" escapado para que no pueda cerrar el <script>
+  const js = JSON.stringify(target).replace(/</g, '\\u003c');
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UniSabana · Volviendo a la app</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#0b2545;color:#fff;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+ div{background:#fff;color:#13315c;padding:28px;border-radius:16px;width:min(360px,90vw);text-align:center}
+ a{display:block;margin-top:18px;padding:13px;border-radius:10px;background:#134074;color:#fff;font-weight:600;text-decoration:none}
+</style></head><body><div>
+ <h1 style="font-size:20px;margin:0 0 8px">Inicio de sesión correcto</h1>
+ <p style="margin:0;color:#555;font-size:14px">Volviendo a la app…</p>
+ <a id="back" href="${esc(target)}">Volver a la app</a>
+ ${plain !== target ? `<a id="plain" href="${esc(plain)}" style="background:none;color:#134074;font-size:13px;font-weight:400">¿No funciona? Abrir enlace directo</a>` : ''}
+</div><script>window.location.replace(${js});</script></body></html>`;
+}
 
 oauthRouter.post('/auth/oauth/token', (req, res) => {
   const { grant_type, code, code_verifier, redirect_uri, client_id } = (req.body ?? {}) as Record<string, string>;
