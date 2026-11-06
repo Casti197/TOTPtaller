@@ -104,7 +104,9 @@ npx expo start --web        # abre http://localhost:8081
     code_challenge = B64URL(SHA256(verifier))
     state = 128 bits aleatorios
  2. openAuthSessionAsync ───────────────────────▶ GET /oauth/authorize ─────────▶ formulario de login
-                                                  POST credenciales ────────────▶ guarda {challenge, redirect_uri}
+                                                  POST contraseña ──────────────▶ pide TOTP (login_ticket, 5 min)
+                                                  POST TOTP ────────────────────▶ C-1/C/C+1 + anti-replay
+                                                                                  guarda {challenge, redirect_uri}
     ◀── deep link ?code&state ◀──────────────────  redirect_uri (JS) ◀──────────  code (60 s, un solo uso)
  3. state == state guardado? (si no → abortar)
  4. POST /auth/oauth/token {code, code_verifier} ───────────────────────────────▶ B64URL(SHA256(verifier)) == challenge?
@@ -147,6 +149,8 @@ npx expo start --web        # abre http://localhost:8081
 - **La semilla TOTP vive en SecureStore**, nunca en AsyncStorage. En web vive solo en memoria, porque no hay almacenamiento cifrado por hardware.
 - **La comparación TOTP es en tiempo constante** (`timingSafeEqual`) y no corta el bucle de ventanas.
 - **TTL anti-replay de 90 s**, que cubre exactamente las tres ventanas aceptadas (C-1, C, C+1).
+- **2FA también en el inicio de sesión.** El proveedor de identidad pide el TOTP después de la contraseña y solo entonces emite el `authorization_code`. Lo exige el servidor, no una pantalla de la app. Entre los dos pasos viaja un `login_ticket` (JWT de 5 min atado al `code_challenge`), así que la contraseña no se reenvía, y el ticket no sirve como bearer de la API. El `access_token` resultante sigue con `mfa_verified: false`: la Bóveda exige su propio Step-Up (sesión elevada de 10 min).
+- **Login y Step-Up comparten la caché anti-replay.** Un código usado para entrar no sirve para abrir la Bóveda en esos 90 s, así que hay que esperar el siguiente código.
 - **Alcance de la PoC.** Se usa HTTP en LAN para la demo. En producción: HTTPS, Universal Links / App Links para la redirección, almacenamiento persistente con hash de los refresh tokens, y limitación de intentos en `/auth/mfa/verify`.
 
 ---
@@ -160,11 +164,11 @@ npx expo start --web        # abre http://localhost:8081
 
 | # | Prueba | Cómo demostrarla |
 | --- | --- | --- |
-| 1 | OAuth + PKCE con navegador del sistema | *Iniciar sesión* → se abre el navegador nativo (con barra de URL, no un WebView) → contraseña `Sabana2026!` → la app regresa por deep link a las pestañas. El `refresh_token` queda en SecureStore (Perfil → "Keychain / Keystore"). |
+| 1 | OAuth + PKCE con navegador del sistema (+ 2FA) | *Iniciar sesión* → se abre el navegador nativo (con barra de URL, no un WebView) → contraseña `Sabana2026!` → **código TOTP** de la app o de Google Authenticator → la app regresa por deep link a las pestañas. Si escribes un código incorrecto, el login no avanza. El `refresh_token` queda en SecureStore (Perfil → "Keychain / Keystore"). |
 | 2 | Paridad con Google Authenticator | Poner los dos teléfonos o apps lado a lado: los mismos 6 dígitos y el mismo cambio de código cada 30 s. |
 | 3 | Modo Avión | Activar Modo Avión → pestaña Authenticator → esperar a que la barra llegue a 0 → aparece el nuevo código. Sin red. También funciona sin sesión, desde *Abrir Authenticator (offline)*. |
 | 4 | Step-Up y Bóveda | Desactivar Modo Avión → **Bóveda** → *Abrir Bóveda Crítica* → la app atrapa el `403 mfa_required` y abre el modal 2FA → *Usar código local* o escribir el código → se abre la bóveda. |
-| 5 | Anti-Replay | Dentro de la bóveda → *Reenviar el mismo código* → aparece **409 Conflict · Replay Attack Detected**. También se puede *Cerrar bóveda*, abrirla de nuevo y escribir a mano el mismo código. |
+| 5 | Anti-Replay | Dentro de la bóveda → *Reenviar el mismo código* → aparece **409 Conflict · Replay Attack Detected**. También se puede *Cerrar bóveda*, abrirla de nuevo y escribir a mano el mismo código, o abrir la Bóveda justo después del login con el mismo código que usaste para entrar. |
 
 **Extra (Silent Refresh Queue):** pestaña **Perfil** → *1 · Simular access_token expirado* → *2 · Lanzar 3 peticiones concurrentes*. El registro muestra tres `401`, **una sola** llamada `POST /auth/refresh` y tres reintentos `200`, sin salir de la pantalla. *Simular refresh_token revocado* limpia SecureStore y regresa a la pantalla de bienvenida.
 
@@ -182,7 +186,8 @@ npx expo start --web        # abre http://localhost:8081
 | Método | Ruta | Descripción |
 | --- | --- | --- |
 | GET | `/oauth/authorize` | Página de login (parámetros: `response_type=code`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`) |
-| POST | `/oauth/authorize` | Valida credenciales → página que abre `redirect_uri?code=…&state=…` (JS + botón "Volver a la app"; Chrome en Android ignora un `302` a un esquema propio tras un POST) |
+| POST | `/oauth/authorize` | Valida la contraseña → página que pide el TOTP (con `login_ticket`) · `401` credenciales incorrectas |
+| POST | `/oauth/authorize/mfa` | `{login_ticket, totp, …}` → `401` código incorrecto · `409` replay · si es válido, página que abre `redirect_uri?code=…&state=…` (JS + botón "Volver a la app"; Chrome en Android ignora un `302` a un esquema propio tras un POST) |
 | POST | `/auth/oauth/token` | `{grant_type, code, code_verifier, redirect_uri, client_id}` → `access_token` + `refresh_token` |
 | POST | `/auth/refresh` | `{refresh_token}` → tokens nuevos (rotación) · `401` si venció o fue revocado |
 | POST | `/auth/logout` | Revoca el `refresh_token` |

@@ -23,6 +23,7 @@ export const config = {
     stepUp: 300, // 5 min
     elevated: 600, // 10 min
     authCode: 60, // 1 min
+    loginMfa: 300, // 5 min para ingresar el TOTP tras la contraseña
     replay: 90, // 90 s
   },
 } as const;

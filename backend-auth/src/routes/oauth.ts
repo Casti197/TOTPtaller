@@ -1,8 +1,9 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
-import { sign, ttlOf } from '../jwt.js';
-import { authCodes, issueRefreshToken, randomToken, refreshTokens } from '../store.js';
+import { sign, ttlOf, verify } from '../jwt.js';
+import { verifyTotp } from '../totp.js';
+import { authCodes, checkAndMarkReplay, issueRefreshToken, randomToken, refreshTokens } from '../store.js';
 
 export const oauthRouter = Router();
 
@@ -58,35 +59,62 @@ function readParams(src: Record<string, unknown>): AuthorizeParams | string {
   return p;
 }
 
-function loginPage(p: AuthorizeParams, error?: string): string {
+/** Plantilla común de las páginas del proveedor de identidad (contraseña y TOTP). */
+function idpPage(title: string, action: string, p: AuthorizeParams, fields: string, error?: string): string {
   const hidden = Object.entries(p)
     .map(([k, v]) => `<input type="hidden" name="${k}" value="${esc(v)}">`)
     .join('');
   return `<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UniSabana · Iniciar sesión</title>
+<title>UniSabana · ${esc(title)}</title>
 <style>
  body{font-family:system-ui,sans-serif;background:#0b2545;color:#fff;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center}
  form{background:#fff;color:#13315c;padding:28px;border-radius:16px;width:min(360px,90vw);box-shadow:0 10px 30px #0006}
  h1{font-size:20px;margin:0 0 4px} p{margin:0 0 18px;color:#555;font-size:14px}
  label{display:block;font-size:13px;margin:12px 0 4px;font-weight:600}
- input[type=email],input[type=password]{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccd;border-radius:10px;font-size:16px}
+ input[type=email],input[type=password],input[inputmode=numeric]{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccd;border-radius:10px;font-size:16px}
+ input[inputmode=numeric]{font-family:ui-monospace,Menlo,monospace;font-size:28px;letter-spacing:8px;text-align:center}
  button{margin-top:20px;width:100%;padding:13px;border:0;border-radius:10px;background:#134074;color:#fff;font-size:16px;font-weight:600}
  .err{background:#fde8e8;color:#9b1c1c;padding:10px;border-radius:8px;font-size:14px;margin-bottom:8px}
  small{display:block;margin-top:14px;color:#777;font-size:12px}
 </style></head><body>
-<form method="post" action="/oauth/authorize">
+<form method="post" action="${action}">
  <h1>Universidad de La Sabana</h1>
  <p>Proveedor de identidad · OAuth 2.0 + PKCE</p>
  ${error ? `<div class="err">${esc(error)}</div>` : ''}
  ${hidden}
- <label for="email">Correo institucional</label>
+ ${fields}
+</form></body></html>`;
+}
+
+function loginPage(p: AuthorizeParams, error?: string): string {
+  return idpPage(
+    'Iniciar sesión',
+    '/oauth/authorize',
+    p,
+    `<label for="email">Correo institucional</label>
  <input id="email" name="email" type="email" autocomplete="username" value="${esc(config.demoUser.email)}" required>
  <label for="password">Contraseña</label>
  <input id="password" name="password" type="password" autocomplete="current-password" required>
- <button type="submit">Iniciar sesión</button>
- <small>Estás en el navegador del sistema: la app nunca ve tu contraseña.</small>
-</form></body></html>`;
+ <button type="submit">Continuar</button>
+ <small>Estás en el navegador del sistema: la app nunca ve tu contraseña.</small>`,
+    error,
+  );
+}
+
+/** Paso 2 del login: código TOTP. El ticket prueba que la contraseña ya se validó (sin reenviarla). */
+function totpPage(p: AuthorizeParams, ticket: string, error?: string): string {
+  return idpPage(
+    'Verificación en dos pasos',
+    '/oauth/authorize/mfa',
+    p,
+    `<input type="hidden" name="login_ticket" value="${esc(ticket)}">
+ <label for="totp">Código de tu Authenticator (6 dígitos)</label>
+ <input id="totp" name="totp" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" autocomplete="one-time-code" autofocus required>
+ <button type="submit">Verificar e iniciar sesión</button>
+ <small>Ábrelo en la app (“Abrir Authenticator (offline)”) o en Google Authenticator.</small>`,
+    error,
+  );
 }
 
 oauthRouter.get('/oauth/authorize', (req, res) => {
@@ -110,9 +138,40 @@ oauthRouter.post('/oauth/authorize', (req, res) => {
     res.status(401).type('html').send(loginPage(p, 'Credenciales incorrectas'));
     return;
   }
+  // Contraseña correcta: falta el segundo factor. El ticket queda atado a este code_challenge.
+  res.type('html').send(totpPage(p, sign(u.id, 'login_mfa', { cc: p.code_challenge })));
+});
+
+oauthRouter.post('/oauth/authorize/mfa', (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const p = readParams(body);
+  if (typeof p === 'string') {
+    res.status(400).send(`Solicitud de autorización inválida: ${esc(p)}`);
+    return;
+  }
+  const ticket = String(body.login_ticket ?? '');
+  const claims = verify(ticket);
+  if (!claims || claims.typ !== 'login_mfa' || claims.cc !== p.code_challenge) {
+    res.status(401).type('html').send(loginPage(p, 'La verificación expiró. Ingresa de nuevo tu contraseña.'));
+    return;
+  }
+  const otp = String(body.totp ?? '').replace(/\s/g, '');
+  // Mismas reglas que el Step-Up: ventanas C-1, C, C+1 y caché anti-replay compartida
+  if (verifyTotp(config.demoUser.totpSecret, otp) === null) {
+    res.status(401).type('html').send(totpPage(p, ticket, 'Código TOTP incorrecto o fuera de la ventana de tiempo'));
+    return;
+  }
+  if (checkAndMarkReplay(claims.sub, otp)) {
+    res.status(409).type('html').send(totpPage(p, ticket, 'Replay detectado: este código ya fue usado. Espera el siguiente.'));
+    return;
+  }
+  issueCodeAndReturn(req, res, p, claims.sub);
+});
+
+function issueCodeAndReturn(req: Request, res: Response, p: AuthorizeParams, userId: string): void {
   const code = randomToken(32);
   authCodes.set(code, {
-    userId: u.id,
+    userId,
     clientId: p.client_id,
     redirectUri: p.redirect_uri,
     codeChallenge: p.code_challenge,
@@ -124,9 +183,10 @@ oauthRouter.post('/oauth/authorize', (req, res) => {
   // Chrome (Android) suele ignorar en silencio un 302 hacia un esquema propio (exp://, unisabana-auth://)
   // cuando viene tras un POST. Se entrega una página que abre el deep link por JS y ofrece un botón
   // (gesto del usuario, siempre permitido) como respaldo.
-  const target = redirect.toString();  const android = /Android/i.test(req.get('user-agent') ?? '');
+  const target = redirect.toString();
+  const android = /Android/i.test(req.get('user-agent') ?? '');
   res.type('html').send(callbackPage(android ? androidIntent(redirect) : target, target));
-});
+}
 
 /**
  * En Android, Chrome/Custom Tabs ignoran a menudo los enlaces a esquemas propios (exp://…).

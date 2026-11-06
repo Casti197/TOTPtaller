@@ -3,7 +3,7 @@
  * Uso: npm run dev   (en otra terminal)  →  npm run e2e
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { totp } from '../src/totp.js';
+import { base32Decode, counterAt, hotp } from '../src/totp.js';
 import { config } from '../src/config.js';
 
 const BASE = process.env.API_URL ?? `http://localhost:${config.port}`;
@@ -19,6 +19,52 @@ function check(name: string, ok: boolean, extra?: unknown): void {
 async function deepLinkOf(r: Response): Promise<string> {
   const href = /id="back" href="([^"]+)"/.exec(await r.text())?.[1] ?? '';
   return href.replace(/&amp;/g, '&');
+}
+
+/** Ticket del paso 2 del login (página TOTP). */
+function ticketOf(html: string): string {
+  return /name="login_ticket" value="([^"]+)"/.exec(html)?.[1] ?? '';
+}
+
+const KEY = base32Decode(config.demoUser.totpSecret);
+
+/** Códigos válidos ahora mismo: ventanas C, C+1 y C-1 (el backend acepta las tres). */
+function codesNow(): string[] {
+  const c = counterAt(Date.now() / 1000);
+  return [0, 1, -1].map((w) => hotp(KEY, c + w));
+}
+
+/** Un código de 6 dígitos que no es válido en ninguna de las ventanas actuales. */
+function wrongCode(): string {
+  const valid = new Set(codesNow());
+  for (let n = 0; ; n++) {
+    const c = String(n).padStart(6, '0');
+    if (!valid.has(c)) return c;
+  }
+}
+
+/**
+ * Login y Step-Up comparten la caché anti-replay (90 s): prueba los códigos válidos hasta encontrar
+ * uno no usado; si los tres ya se usaron (ejecuciones seguidas), espera a la siguiente ventana.
+ */
+async function withFreshCode(send: (code: string) => Promise<Response>): Promise<{ res: Response; code: string }> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    for (const code of codesNow()) {
+      const res = await send(code);
+      if (res.status !== 409) return { res, code };
+    }
+    console.log('     (códigos actuales ya usados; esperando la siguiente ventana de 30 s...)');
+    await new Promise((r) => setTimeout(r, (30 - (Math.floor(Date.now() / 1000) % 30) + 1) * 1000));
+  }
+  throw new Error('No se encontró un código TOTP sin usar');
+}
+
+/** Login completo: contraseña → TOTP → deep link de regreso. */
+async function loginFull(params: Record<string, string>): Promise<string> {
+  const pwd = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
+  const ticket = ticketOf(await pwd.text());
+  const { res } = await withFreshCode((c) => post('/oauth/authorize/mfa', { ...params, login_ticket: ticket, totp: c }, true));
+  return deepLinkOf(res);
 }
 
 async function post(path: string, body: Record<string, string>, form = false): Promise<Response> {
@@ -50,9 +96,25 @@ async function main(): Promise<void> {
   const bad = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: 'x' }, true);
   check('Login con contraseña incorrecta → 401', bad.status === 401);
 
-  const login = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
+  const pwd = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
+  const ticket = ticketOf(await pwd.text());
+  check('Contraseña correcta → pide TOTP (sin emitir código)', pwd.status === 200 && !!ticket);
+
+  const badTotp = await post('/oauth/authorize/mfa', { ...params, login_ticket: ticket, totp: wrongCode() }, true);
+  check('Login con TOTP incorrecto → 401', badTotp.status === 401);
+
+  const otherChallenge = createHash('sha256').update(randomBytes(32)).digest('base64url');
+  const swapped = await post('/oauth/authorize/mfa', { ...params, code_challenge: otherChallenge, login_ticket: ticket, totp: codesNow()[0] }, true);
+  check('Ticket usado con otro code_challenge → 401', swapped.status === 401);
+
+  const { res: login, code: loginOtp } = await withFreshCode((c) =>
+    post('/oauth/authorize/mfa', { ...params, login_ticket: ticket, totp: c }, true),
+  );
   const location = await deepLinkOf(login);
-  check('Login → página que abre el deep link', login.status === 200 && location.startsWith(REDIRECT), location);
+  check(`Login con TOTP ${loginOtp} → página que abre el deep link`, login.status === 200 && location.startsWith(REDIRECT), location);
+
+  const loginReplay = await post('/oauth/authorize/mfa', { ...params, login_ticket: ticket, totp: loginOtp }, true);
+  check('Mismo TOTP en el login otra vez → 409 Replay', loginReplay.status === 409);
   const cb = new URL(location);
   check('state regresa intacto', cb.searchParams.get('state') === state);
   const code = cb.searchParams.get('code') ?? '';
@@ -64,8 +126,7 @@ async function main(): Promise<void> {
   });
   check('PKCE con code_verifier incorrecto → 400', wrong.status === 400);
 
-  const login2 = await post('/oauth/authorize', { ...params, email: config.demoUser.email, password: config.demoUser.password }, true);
-  const code2 = new URL(await deepLinkOf(login2)).searchParams.get('code') ?? '';
+  const code2 = new URL(await loginFull(params)).searchParams.get('code') ?? '';
   const tokRes = await post('/auth/oauth/token', {
     grant_type: 'authorization_code', code: code2, code_verifier: verifier,
     redirect_uri: REDIRECT, client_id: 'unisabana-mobile',
@@ -95,22 +156,12 @@ async function main(): Promise<void> {
   const vaultJson = (await vault.json()) as { error: string; step_up_token: string };
   check('Bóveda con access_token estándar → 403 mfa_required', vault.status === 403 && vaultJson.error === 'mfa_required');
 
-  const wrongCode = await post('/auth/mfa/verify', { step_up_token: vaultJson.step_up_token, code: '000000' === totp(config.demoUser.totpSecret) ? '111111' : '000000' });
-  check('MFA con código incorrecto → 401', wrongCode.status === 401);
+  const wrongMfa = await post('/auth/mfa/verify', { step_up_token: vaultJson.step_up_token, code: wrongCode() });
+  check('MFA con código incorrecto → 401', wrongMfa.status === 401);
 
-  let otp = totp(config.demoUser.totpSecret);
-  let mfa = await post('/auth/mfa/verify', { step_up_token: vaultJson.step_up_token, code: otp });
-  if (mfa.status === 409) {
-    // Este código ya se usó en una ejecución anterior (<90 s): esperar a la siguiente ventana de 30 s
-    let fresh = otp;
-    console.log(`     (código ${otp} ya usado antes; esperando nuevo código...)`);
-    while (fresh === otp) {
-      await new Promise((r) => setTimeout(r, 1000));
-      fresh = totp(config.demoUser.totpSecret);
-    }
-    otp = fresh;
-    mfa = await post('/auth/mfa/verify', { step_up_token: vaultJson.step_up_token, code: otp });
-  }
+  const { res: mfa, code: otp } = await withFreshCode((c) =>
+    post('/auth/mfa/verify', { step_up_token: vaultJson.step_up_token, code: c }),
+  );
   const mfaJson = (await mfa.json()) as { elevated_token: string };
   check(`MFA con código ${otp} → 200 elevated_token`, mfa.status === 200 && !!mfaJson.elevated_token);
 

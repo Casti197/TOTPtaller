@@ -34,7 +34,10 @@ export function WelcomeScreen() {
       <View style={styles.actions}>
         {error ? <Notice tone="error">{error}</Notice> : null}
         <Button title="Iniciar sesión" onPress={() => void onLogin()} loading={busy} />
-        <Text style={styles.hint}>Se abrirá el navegador seguro del sistema (no un WebView).</Text>
+        <Text style={styles.hint}>
+          Se abrirá el navegador seguro del sistema (no un WebView). Te pedirá tu contraseña y el código de 6 dígitos de
+          tu Authenticator.
+        </Text>
         <Button title="Abrir Authenticator (offline)" variant="secondary" onPress={() => router.push('/totp')} />
         <Text style={styles.debug}>
           API: {API_URL || '⚠ EXPO_PUBLIC_API_URL sin configurar'}
